@@ -105,11 +105,11 @@ jobs:
             exit 3
           fi
 
-          # base64 → in Datei (kein riesiger Shell-String)
+          # base64 → Datei
           timeout 60s base64 -w 0 reports/semgrep/semgrep.sarif.gz > reports/semgrep/semgrep.sarif.gz.b64 || {
             echo "base64 encoding timed out" >&2; exit 5; }
 
-          # JSON-Payload ohne große Shell-Variablen (rawfile einbinden)
+          # JSON-Payload mit rawfile
           jq -n \
             --rawfile sarif_b64 reports/semgrep/semgrep.sarif.gz.b64 \
             --arg sha "${{ github.sha }}" \
@@ -118,7 +118,7 @@ jobs:
             '{commit_sha:$sha, ref:$ref, sarif:($sarif_b64), tool_name:$tool}' \
             > sarif_payload.json
 
-          # Upload mit Retries; erwartet HTTP 202
+          # Upload (erwartet 202)
           for i in $(seq 1 "${UPLOAD_MAX_RETRIES}"); do
             echo "Uploading SARIF (attempt $i/${UPLOAD_MAX_RETRIES})..."
             HTTP=$(curl -sS -o response.json -w "%{http_code}" \
