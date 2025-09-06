@@ -16,15 +16,25 @@ jobs:
   bootstrap-sarif:
     runs-on: ubuntu-latest
     steps:
+      - name: Install prerequisites (jq)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: Checkout (manual, no actions)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           set -euxo pipefail
           git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
+          git config --global advice.detachedHead false
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "${SHA}"
+          git checkout --force FETCH_HEAD
 
       - name: Run Semgrep in Docker and produce SARIF
         run: |
