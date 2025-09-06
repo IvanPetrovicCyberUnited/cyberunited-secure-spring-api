@@ -1,0 +1,14 @@
+server:
+  port: 8080
+  tomcat:
+    max-swallow-size: 2MB
+spring:
+  mvc:
+    problemdetails:
+      enabled: true
+  web:
+    cors:
+      allowed-origins: "https://example.com"
+      allowed-methods: "GET,POST"
+      allowed-headers: "Authorization,Content-Type"
+      max-age: 3600
