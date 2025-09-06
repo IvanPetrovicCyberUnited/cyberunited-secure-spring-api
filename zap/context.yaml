@@ -1,0 +1,6 @@
+context:
+  name: secure-api
+  urls:
+    - http://localhost:8080
+  includePaths:
+    - http://localhost:8080/api/.*

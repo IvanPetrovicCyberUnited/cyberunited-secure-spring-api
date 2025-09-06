@@ -1,0 +1,20 @@
+server:
+  error:
+    include-message: never
+    include-binding-errors: never
+  tomcat:
+    max-swallow-size: 2MB
+    connection-timeout: 5s
+spring:
+  mvc:
+    dispatch-trace-request: false
+  web:
+    cors:
+      allowed-origins: "https://example.com"
+      allowed-methods: "GET,POST"
+      allowed-headers: "Authorization,Content-Type"
+      allow-credentials: false
+      max-age: 3600
+app:
+  jwt:
+    secret: 3UWgQLOtxWzt47ahUojpVBO/FxOFsp898ixOUF+6+U0=
