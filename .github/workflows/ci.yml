@@ -26,8 +26,43 @@ env:
 
 jobs:
 
+  # --- 0) DETECT: prüft, welche Dateien vorhanden sind und publiziert Flags ---
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_gradle:     ${{ steps.out.outputs.has_gradle }}
+      has_openapi:    ${{ steps.out.outputs.has_openapi }}
+      has_dockerfile: ${{ steps.out.outputs.has_dockerfile }}
+      has_policy:     ${{ steps.out.outputs.has_policy }}
+    steps:
+      - name: Checkout (manual)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA:  ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "${SHA}"
+          git checkout --force FETCH_HEAD
+      - name: Detect files and set outputs
+        id: out
+        run: |
+          set -euo pipefail
+          test -f gradlew           && echo "has_gradle=true"      >> $GITHUB_OUTPUT || echo "has_gradle=false"      >> $GITHUB_OUTPUT
+          test -f openapi.yaml      && echo "has_openapi=true"     >> $GITHUB_OUTPUT || echo "has_openapi=false"     >> $GITHUB_OUTPUT
+          test -f Dockerfile        && echo "has_dockerfile=true"  >> $GITHUB_OUTPUT || echo "has_dockerfile=false"  >> $GITHUB_OUTPUT
+          test -d policy            && echo "has_policy=true"      >> $GITHUB_OUTPUT || echo "has_policy=false"      >> $GITHUB_OUTPUT
+          echo "Detected:"
+          cat $GITHUB_OUTPUT
+
+  # --- 1) BUILD/TEST/SAST/SCA ---
   build-test-sast:
-    if: ${{ hashFiles('gradlew') != '' }}
+    needs: [ detect ]
+    if: ${{ needs.detect.outputs.has_gradle == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -39,7 +74,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA:  ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -54,15 +89,17 @@ jobs:
           git checkout --force FETCH_HEAD
           git rev-parse --verify HEAD
 
-      - name: Install JDK 21 (fallback 17)
+      - name: Install tools (jq, coreutils) and JDK 21 (fallback 17)
         timeout-minutes: 10
         run: |
           set -euo pipefail
           sudo apt-get update -y
+          sudo apt-get install -y jq coreutils
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
+          jq --version
 
       - name: Gradle build and tests
         timeout-minutes: 20
@@ -107,7 +144,7 @@ jobs:
           fi
 
       - name: Upload SARIF to Code Scanning (API; gzip+base64, retries)
-        if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
+        if: ${{ always() }}
         timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -117,7 +154,9 @@ jobs:
           SARIF_MAX_COMPRESSED: ${{ env.SARIF_MAX_COMPRESSED }}
         run: |
           set -euo pipefail
-          test -s reports/semgrep/semgrep.sarif
+          if [ ! -s reports/semgrep/semgrep.sarif ]; then
+            echo "Missing SARIF, skipping upload"; exit 0
+          fi
           gzip -c reports/semgrep/semgrep.sarif > reports/semgrep/semgrep.sarif.gz
           BYTES=$(stat -c%s reports/semgrep/semgrep.sarif.gz)
           echo "Compressed SARIF size: ${BYTES} bytes"
@@ -152,8 +191,10 @@ jobs:
             exit 4
           fi
 
+  # --- 2) API fuzz/contract ---
   api-fuzz-contract:
-    if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
+    needs: [ detect ]
+    if: ${{ needs.detect.outputs.has_gradle == 'true' && needs.detect.outputs.has_openapi == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -164,7 +205,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA:  ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -195,9 +236,10 @@ jobs:
         if: always()
         run: killall java || true
 
+  # --- 3) Image bauen, scannen, pushen, signieren ---
   build-image:
-    if: ${{ hashFiles('gradlew') != '' && hashFiles('Dockerfile') != '' }}
-    needs: [ build-test-sast ]
+    needs: [ detect, build-test-sast ]
+    if: ${{ needs.detect.outputs.has_gradle == 'true' && needs.detect.outputs.has_dockerfile == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -210,7 +252,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA:  ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -260,9 +302,10 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
+  # --- 4) DAST (Baseline/Full) ---
   dast-zap-baseline:
-    if: ${{ hashFiles('Dockerfile') != '' }}
-    needs: [ build-image ]
+    needs: [ detect, build-image ]
+    if: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -283,8 +326,8 @@ jobs:
             zap-baseline.py -t http://localhost:8080 -a -r zap-baseline.html
 
   dast-zap-auth:
-    if: ${{ hashFiles('Dockerfile') != '' }}
-    needs: [ build-image ]
+    needs: [ detect, build-image ]
+    if: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -304,8 +347,10 @@ jobs:
           docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable:latest \
             zap-full-scan.py -t http://localhost:8080 -r zap-full.html || true
 
+  # --- 5) IaC/Policy ---
   iac-policy:
-    if: ${{ hashFiles('policy/**') != '' }}
+    needs: [ detect ]
+    if: ${{ needs.detect.outputs.has_policy == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -316,7 +361,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA:  ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
