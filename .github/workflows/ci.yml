@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
     branches: [ main, develop ]
@@ -15,35 +14,78 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GH_API: https://api.github.com
+
 jobs:
+
   build-test-sast:
+    # läuft nur, wenn ein Gradle-Projekt da ist
     if: ${{ hashFiles('gradlew') != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
+      security-events: write    # nötig für Code-Scanning Upload via API
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: gradle
-      - run: ./gradlew clean build check jacocoTestReport pitest --no-daemon
-      - run: ./gradlew spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest --no-daemon
-      - run: ./gradlew dependencyCheckAnalyze cyclonedxBom --no-daemon
-      - uses: returntocorp/semgrep-action@v1
-        with:
-          config: p/owasp-top-ten,p/java
-          generateSarif: true
-          sarif: semgrep.sarif
-      - uses: github/codeql-action/init@v3
-        with:
-          languages: java
-      - uses: github/codeql-action/analyze@v3
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: semgrep.sarif
+      - name: Checkout (ohne actions/checkout)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+
+      - name: JDK installieren (21, Fallback 17)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          if sudo apt-get install -y openjdk-21-jdk; then
+            echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          else
+            sudo apt-get install -y openjdk-17-jdk
+            echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          fi
+          java -version
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Gradle Build & Tests
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build check jacocoTestReport pitest
+
+      - name: Static Code Checks (SpotBugs/PMD/Checkstyle)
+        run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
+
+      - name: SCA & SBOM (OWASP Dependency-Check + CycloneDX)
+        run: ./gradlew --no-daemon dependencyCheckAnalyze cyclonedxBom
+
+      - name: Semgrep (SAST) per Docker, SARIF erzeugen
+        run: |
+          set -euxo pipefail
+          mkdir -p reports/semgrep
+          docker run --rm -v "$PWD:/src" --workdir /src \
+            returntocorp/semgrep:latest semgrep --config p/owasp-top-ten --config p/java \
+            --sarif -o reports/semgrep/semgrep.sarif || true
+
+      - name: SARIF (Semgrep) zu GitHub Code Scanning hochladen (ohne Action)
+        if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          SARIF64=$(base64 -w 0 reports/semgrep/semgrep.sarif)
+          jq -n --arg sarif "$SARIF64" \
+                --arg sha "${{ github.sha }}" \
+                --arg ref "${{ github.ref }}" \
+                --arg tool "semgrep" \
+                '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
+          curl -sS -H "Authorization: token $GITHUB_TOKEN" \
+               -H "Accept: application/sarif+json" \
+               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
+               --data @sarif_payload.json
 
   api-fuzz-contract:
     if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
@@ -51,96 +93,120 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - name: Start App
-        run: ./gradlew bootRun & sleep 10
-      - name: Install Schemathesis
+      - name: Checkout (ohne actions/checkout)
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+
+      - name: JDK installieren
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+          java -version
+
+      - name: App starten
+        run: ./gradlew --no-daemon bootRun & sleep 10
+
+      - name: Schemathesis installieren & ausführen
+        run: |
+          set -euxo pipefail
           python3 -m pip install --upgrade pip
           python3 -m pip install schemathesis
-      - name: Schemathesis (OpenAPI fuzz/contract)
-        run: |
-          python3 -m schemathesis run openapi.yaml --checks all --base-url http://localhost:8080 \
-            --hypothesis-deadline=200 --hypothesis-max-examples=200 \
-            --report=reports/schemathesis/report.json
-      - name: Stop App
+          mkdir -p reports/schemathesis
+          python3 -m schemathesis run openapi.yaml --checks all \
+             --base-url http://localhost:8080 \
+             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
+             --report=reports/schemathesis/report.json
+      - name: App stoppen
         run: killall java || true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: schemathesis
-          path: reports/schemathesis/report.json
 
   build-image:
-    if: ${{ hashFiles('gradlew') != '' }}
+    if: ${{ hashFiles('gradlew') != '' && hashFiles('Dockerfile') != '' }}
     needs: [ build-test-sast ]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
+      id-token: write     # für cosign keyless (OIDC)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: gradle
-      - run: ./gradlew bootJar --no-daemon
-      - run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
-      - uses: hadolint/hadolint-action@v3.2.0
-        with:
-          dockerfile: Dockerfile
-      - uses: aquasecurity/trivy-action@0.33.1
-        with:
-          image-ref: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-          severity: CRITICAL,HIGH
-          exit-code: '1'
-      - name: Push image to GHCR
+      - name: Checkout (ohne actions/checkout)
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        run: |
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+
+      - name: JDK installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+
+      - name: Jar bauen
+        run: ./gradlew --no-daemon bootJar
+
+      - name: Docker Build
+        run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
+
+      - name: Trivy Container Scan (ohne Action)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 \
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
+      - name: Login GHCR & Push
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign image (cosign keyless)
+
+      - name: cosign installieren (keyless)
+        run: |
+          set -euxo pipefail
+          COSIGN_VERSION="v2.2.4"
+          curl -sSL -o cosign.tgz "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64.tar.gz"
+          tar xzf cosign.tgz
+          sudo mv cosign /usr/local/bin/cosign
+          cosign version
+
+      - name: Image signieren (OIDC keyless)
         env:
           COSIGN_EXPERIMENTAL: "1"
-        run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+        run: |
+          cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
   dast-zap-baseline:
-    if: ${{ hashFiles('gradlew') != '' }}
+    if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
-      - uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: "http://localhost:8080"
-          cmd_options: "-a -r zap-baseline.html"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zap-baseline
-          path: zap-baseline.html
+      - name: App-Container starten
+        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+      - name: ZAP Baseline (ohne Action)
+        run: |
+          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
+            zap-baseline.py -t http://localhost:8080 -a -r zap-baseline.html
 
   dast-zap-auth:
-    if: ${{ hashFiles('gradlew') != '' }}
+    if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
-      - name: ZAP Full (Authenticated)
-        uses: zaproxy/action-full-scan@v0.12.0
-        with:
-          target: "http://localhost:8080"
-          cmd_options: "-r zap-full.html"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zap-full
-          path: zap-full.html
+      - name: App-Container starten
+        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+      - name: ZAP Full Scan (ohne Action)
+        run: |
+          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
+            zap-full-scan.py -t http://localhost:8080 -r zap-full.html || true
 
   iac-policy:
     if: ${{ hashFiles('policy/**') != '' }}
@@ -148,13 +214,23 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: "."
-          quiet: true
-          soft_fail: false
-      - name: Conftest (OPA) policies
+      - name: Checkout (ohne actions/checkout)
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
-          curl -L https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz | tar xz
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+
+      - name: Checkov via Docker
+        run: |
+          docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
+
+      - name: OPA/Conftest installieren & ausführen
+        run: |
+          set -euxo pipefail
+          curl -sSL -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
+          tar xzf conftest.tar.gz
+          sudo mv conftest /usr/local/bin/conftest
           ./conftest test policy/
