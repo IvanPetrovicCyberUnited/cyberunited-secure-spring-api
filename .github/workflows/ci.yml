@@ -20,80 +20,13 @@ env:
 jobs:
 
   build-test-sast:
-    # läuft nur, wenn ein Gradle-Projekt da ist
     if: ${{ hashFiles('gradlew') != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write    # nötig für Code-Scanning Upload via API
+      security-events: write
     steps:
-      - name: Checkout (ohne actions/checkout)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euxo pipefail
-          git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
-
-      - name: JDK installieren (21, Fallback 17)
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          if sudo apt-get install -y openjdk-21-jdk; then
-            echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
-          else
-            sudo apt-get install -y openjdk-17-jdk
-            echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
-          fi
-          java -version
-          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
-
-      - name: Gradle Build & Tests
-        run: |
-          set -euxo pipefail
-          chmod +x gradlew
-          ./gradlew --no-daemon clean build check jacocoTestReport pitest
-
-      - name: Static Code Checks (SpotBugs/PMD/Checkstyle)
-        run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
-
-      - name: SCA & SBOM (OWASP Dependency-Check + CycloneDX)
-        run: ./gradlew --no-daemon dependencyCheckAnalyze cyclonedxBom
-
-      - name: Semgrep (SAST) per Docker, SARIF erzeugen
-        run: |
-          set -euxo pipefail
-          mkdir -p reports/semgrep
-          docker run --rm -v "$PWD:/src" --workdir /src \
-            returntocorp/semgrep:latest semgrep --config p/owasp-top-ten --config p/java \
-            --sarif -o reports/semgrep/semgrep.sarif || true
-
-      - name: SARIF (Semgrep) zu GitHub Code Scanning hochladen (ohne Action)
-        if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euxo pipefail
-          SARIF64=$(base64 -w 0 reports/semgrep/semgrep.sarif)
-          jq -n --arg sarif "$SARIF64" \
-                --arg sha "${{ github.sha }}" \
-                --arg ref "${{ github.ref }}" \
-                --arg tool "semgrep" \
-                '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
-          curl -sS -H "Authorization: token $GITHUB_TOKEN" \
-               -H "Accept: application/sarif+json" \
-               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
-               --data @sarif_payload.json
-
-  api-fuzz-contract:
-    if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout (ohne actions/checkout)
+      - name: Checkout (manual)
         env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
           set -euxo pipefail
@@ -102,27 +35,77 @@ jobs:
           git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
           git checkout --force "${{ github.sha }}"
 
-      - name: JDK installieren
+      - name: Install JDK 21 (fallback 17)
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
 
-      - name: App starten
-        run: ./gradlew --no-daemon bootRun & sleep 10
+      - name: Gradle build & tests
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build check jacocoTestReport pitest
 
-      - name: Schemathesis installieren & ausführen
+      - name: Static checks (SpotBugs/PMD/Checkstyle)
+        run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
+
+      - name: SCA & SBOM (OWASP DC + CycloneDX)
+        run: ./gradlew --no-daemon dependencyCheckAnalyze cyclonedxBom
+
+      - name: SAST (Semgrep via Docker) → SARIF
+        run: |
+          set -euxo pipefail
+          mkdir -p reports/semgrep
+          docker run --rm -v "$PWD:/src" --workdir /src \
+            returntocorp/semgrep:latest \
+            semgrep --config p/owasp-top-ten --config p/java \
+            --sarif -o reports/semgrep/semgrep.sarif || true
+
+      - name: Upload SARIF to Code Scanning (API)
+        if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        run: |
+          set -euxo pipefail
+          SARIF64=$(base64 -w 0 reports/semgrep/semgrep.sarif)
+          jq -n --arg sarif "$SARIF64" --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg tool "semgrep" \
+            '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
+          curl -sS -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/sarif+json" \
+               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" --data @sarif_payload.json
+
+  api-fuzz-contract:
+    if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - name: Checkout (manual)
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        run: |
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+      - name: Install JDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+      - name: Start app
+        run: ./gradlew --no-daemon bootRun & sleep 10
+      - name: Schemathesis fuzz/contract
         run: |
           set -euxo pipefail
           python3 -m pip install --upgrade pip
           python3 -m pip install schemathesis
           mkdir -p reports/schemathesis
           python3 -m schemathesis run openapi.yaml --checks all \
-             --base-url http://localhost:8080 \
-             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
-             --report=reports/schemathesis/report.json
-      - name: App stoppen
+            --base-url http://localhost:8080 \
+            --hypothesis-deadline=200 --hypothesis-max-examples=200 \
+            --report=reports/schemathesis/report.json
+      - name: Stop app
         run: killall java || true
 
   build-image:
@@ -132,9 +115,9 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write     # für cosign keyless (OIDC)
+      id-token: write
     steps:
-      - name: Checkout (ohne actions/checkout)
+      - name: Checkout (manual)
         env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
           set -euxo pipefail
@@ -142,30 +125,24 @@ jobs:
           git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
           git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
           git checkout --force "${{ github.sha }}"
-
-      - name: JDK installieren
+      - name: Install JDK
         run: |
           sudo apt-get update
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
-
-      - name: Jar bauen
+      - name: Build jar
         run: ./gradlew --no-daemon bootJar
-
-      - name: Docker Build
+      - name: Docker build
         run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
-
-      - name: Trivy Container Scan (ohne Action)
+      - name: Trivy scan (no action)
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 \
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-
-      - name: Login GHCR & Push
+      - name: Push to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-
-      - name: cosign installieren (keyless)
+      - name: Install cosign (keyless)
         run: |
           set -euxo pipefail
           COSIGN_VERSION="v2.2.4"
@@ -173,23 +150,19 @@ jobs:
           tar xzf cosign.tgz
           sudo mv cosign /usr/local/bin/cosign
           cosign version
-
-      - name: Image signieren (OIDC keyless)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
-        run: |
-          cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+      - name: Sign image
+        env: { COSIGN_EXPERIMENTAL: "1" }
+        run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
   dast-zap-baseline:
     if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: { contents: read }
     steps:
-      - name: App-Container starten
+      - name: Start app container
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
-      - name: ZAP Baseline (ohne Action)
+      - name: ZAP Baseline (no action)
         run: |
           docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
             zap-baseline.py -t http://localhost:8080 -a -r zap-baseline.html
@@ -198,12 +171,11 @@ jobs:
     if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: { contents: read }
     steps:
-      - name: App-Container starten
+      - name: Start app container
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
-      - name: ZAP Full Scan (ohne Action)
+      - name: ZAP Full (no action)
         run: |
           docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
             zap-full-scan.py -t http://localhost:8080 -r zap-full.html || true
@@ -211,10 +183,9 @@ jobs:
   iac-policy:
     if: ${{ hashFiles('policy/**') != '' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: { contents: read }
     steps:
-      - name: Checkout (ohne actions/checkout)
+      - name: Checkout (manual)
         env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
           set -euxo pipefail
@@ -222,12 +193,9 @@ jobs:
           git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
           git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
           git checkout --force "${{ github.sha }}"
-
       - name: Checkov via Docker
-        run: |
-          docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
-
-      - name: OPA/Conftest installieren & ausführen
+        run: docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
+      - name: OPA/Conftest install & run
         run: |
           set -euxo pipefail
           curl -sSL -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
