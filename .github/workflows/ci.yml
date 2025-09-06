@@ -1,0 +1,114 @@
+name: CI
+on:
+  push: { branches: [ main, develop ], paths-ignore: [ "docs/**", "*.md" ] }
+  pull_request: { branches: [ "**" ], paths-ignore: [ "docs/**", "*.md" ] }
+  schedule: [ { cron: "0 2 * * *" } ]
+  workflow_dispatch:
+
+concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
+
+jobs:
+  build-test-sast:
+    if: ${{ hashFiles('gradlew') != '' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: gradle }
+      - run: ./gradlew clean build check jacocoTestReport pitest --no-daemon
+      - run: ./gradlew spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest --no-daemon
+      - run: ./gradlew dependencyCheckAnalyze cyclonedxBom --no-daemon
+      - uses: returntocorp/semgrep-action@v1
+        with: { config: p/owasp-top-ten,p/java, generateSarif: true, sarif: semgrep.sarif }
+      - uses: github/codeql-action/init@v3
+        with: { languages: java }
+      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: semgrep.sarif }
+
+  api-fuzz-contract:
+    if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./gradlew bootRun & sleep 10
+      - name: Schemathesis
+        run: |
+          pipx install schemathesis
+          schemathesis run openapi.yaml --checks all --base-url http://localhost:8080 \
+            --hypothesis-deadline=200 --hypothesis-max-examples=200 \
+            --report=reports/schemathesis/report.json
+      - run: killall java || true
+      - uses: actions/upload-artifact@v4
+        with: { name: schemathesis, path: reports/schemathesis/report.json }
+
+  build-image:
+    if: ${{ hashFiles('gradlew') != '' }}
+    needs: [ build-test-sast ]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: gradle }
+      - run: ./gradlew bootJar --no-daemon
+      - run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
+      - uses: hadolint/hadolint-action@v3.1.0
+        with: { dockerfile: Dockerfile }
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+      - uses: sigstore/cosign-installer@v3
+      - env: { COSIGN_EXPERIMENTAL: "1" }
+        run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
+  dast-zap-baseline:
+    if: ${{ hashFiles('gradlew') != '' }}
+    needs: [ build-image ]
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+      - uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:8080"
+          cmd_options: "-a -r zap-baseline.html"
+      - uses: actions/upload-artifact@v4
+        with: { name: zap-baseline, path: zap-baseline.html }
+
+  dast-zap-auth:
+    if: ${{ hashFiles('gradlew') != '' }}
+    needs: [ build-image ]
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+      - name: ZAP Full (Authenticated)
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: "http://localhost:8080"
+          cmd_options: "-r zap-full.html"
+      - uses: actions/upload-artifact@v4
+        with: { name: zap-full, path: zap-full.html }
+
+  iac-policy:
+    if: ${{ hashFiles('policy/**') != '' }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@v12
+        with: { directory: ".", quiet: true, soft_fail: false }
+      - name: Conftest (OPA)
+        run: |
+          curl -L https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz | tar xz
+          ./conftest test policy/
