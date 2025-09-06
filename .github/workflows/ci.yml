@@ -51,7 +51,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Start App
         run: ./gradlew bootRun & sleep 10
       - name: Install Schemathesis
@@ -87,7 +87,7 @@ jobs:
           cache: gradle
       - run: ./gradlew bootJar --no-daemon
       - run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: hadolint/hadolint-action@v3.2.0
         with:
           dockerfile: Dockerfile
       - uses: aquasecurity/trivy-action@v0.24.0
@@ -112,7 +112,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
       - uses: zaproxy/action-baseline@v0.12.0
         with:
@@ -130,7 +130,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
       - name: ZAP Full (Authenticated)
         uses: zaproxy/action-full-scan@v0.10.0
@@ -148,7 +148,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: bridgecrewio/checkov-action@v12
         with:
           directory: "."
