@@ -9,7 +9,7 @@ on:
     paths-ignore: [ "docs/**", "*.md" ]
   schedule:
     - cron: "0 2 * * *"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,13 +17,12 @@ concurrency:
 
 env:
   GH_API: https://api.github.com
-  # Controls (zentral)
-  CURL_CONNECT_TIMEOUT: "10"      # s
-  CURL_MAX_TIME: "120"            # s
+  CURL_CONNECT_TIMEOUT: "10"
+  CURL_MAX_TIME: "120"
   UPLOAD_MAX_RETRIES: "3"
-  SEMGREP_TIMEOUT_SECONDS: "420"  # 7 min
-  SEMGREP_MAX_BYTES: "200000000"  # ~200 MB
-  SARIF_MAX_COMPRESSED: "10485760" # 10 MiB gz-Limit
+  SEMGREP_TIMEOUT_SECONDS: "420"
+  SEMGREP_MAX_BYTES: "200000000"
+  SARIF_MAX_COMPRESSED: "10485760"
 
 jobs:
 
@@ -50,7 +49,7 @@ jobs:
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
           for i in 1 2; do
             if git fetch --depth=1 origin "${SHA}"; then break; fi
-            echo "Retry fetch ($i/2)..." >&2; sleep 2
+            echo "Retry fetch ($i/2)"; sleep 2
           done
           git checkout --force FETCH_HEAD
           git rev-parse --verify HEAD
@@ -65,7 +64,7 @@ jobs:
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
 
-      - name: Gradle build & tests
+      - name: Gradle build and tests
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -76,11 +75,11 @@ jobs:
         timeout-minutes: 15
         run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
 
-      - name: SCA & SBOM (OWASP DC + CycloneDX)
+      - name: SCA and SBOM (OWASP DC + CycloneDX)
         timeout-minutes: 15
         run: ./gradlew --no-daemon dependencyCheckAnalyze cyclonedxBom
 
-      - name: SAST (Semgrep via Docker) → SARIF
+      - name: SAST Semgrep to SARIF
         timeout-minutes: 15
         env:
           SEMGREP_TIMEOUT_SECONDS: ${{ env.SEMGREP_TIMEOUT_SECONDS }}
@@ -90,7 +89,7 @@ jobs:
           mkdir -p reports/semgrep
           for i in 1 2 3; do
             if docker pull returntocorp/semgrep:latest; then break; fi
-            echo "Retry docker pull semgrep ($i/3)..." >&2; sleep 3
+            echo "Retry docker pull semgrep ($i/3)"; sleep 3
           done
           docker run --rm -v "$PWD:/src" --workdir /src \
             returntocorp/semgrep:latest \
@@ -99,7 +98,6 @@ jobs:
                     --max-target-bytes "${SEMGREP_MAX_BYTES}" \
                     --metrics=off \
                     --sarif -o reports/semgrep/semgrep.sarif || true
-          # Fallback: minimale SARIF erzeugen, falls leer
           if [ ! -s reports/semgrep/semgrep.sarif ]; then
             jq -n '{
               "$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
@@ -124,8 +122,7 @@ jobs:
           BYTES=$(stat -c%s reports/semgrep/semgrep.sarif.gz)
           echo "Compressed SARIF size: ${BYTES} bytes"
           if [ "$BYTES" -ge "$SARIF_MAX_COMPRESSED" ]; then
-            echo "Compressed SARIF exceeds ${SARIF_MAX_COMPRESSED} bytes" >&2
-            exit 3
+            echo "Compressed SARIF exceeds limit"; exit 3
           fi
           base64 -w 0 reports/semgrep/semgrep.sarif.gz > reports/semgrep/semgrep.sarif.gz.b64
           jq -n \
@@ -138,7 +135,7 @@ jobs:
 
           HTTP="000"
           for i in 1 2 3; do
-            echo "Uploading SARIF (attempt $i/3)…"
+            echo "Uploading SARIF (attempt $i/3)"
             HTTP=$(curl -sS -o response.json -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/json" \
@@ -147,12 +144,11 @@ jobs:
               --max-time "${CURL_MAX_TIME}" \
               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
               --data @sarif_payload.json || echo "000")
-            [ "$HTTP" = "202" ] && { echo "Upload accepted (202)."; break; }
-            echo "Upload failed (HTTP=$HTTP), retrying…" >&2; sleep 4
+            [ "$HTTP" = "202" ] && { echo "Upload accepted (202)"; break; }
+            echo "Upload failed (HTTP=$HTTP). Retrying..."; sleep 4
           done
           if [ "$HTTP" != "202" ]; then
-            echo "Final upload failed (HTTP=$HTTP). Response:" >&2
-            cat response.json >&2 || true
+            echo "Final upload failed (HTTP=$HTTP). Response:"; cat response.json || true
             exit 4
           fi
 
@@ -165,7 +161,10 @@ jobs:
     steps:
       - name: Checkout (manual)
         timeout-minutes: 10
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -181,7 +180,7 @@ jobs:
       - name: Start app
         timeout-minutes: 2
         run: ./gradlew --no-daemon bootRun & sleep 15
-      - name: Schemathesis fuzz/contract
+      - name: Schemathesis fuzz and contract
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -208,7 +207,10 @@ jobs:
     steps:
       - name: Checkout (manual)
         timeout-minutes: 10
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -233,7 +235,7 @@ jobs:
           set -euo pipefail
           for i in 1 2 3; do
             if docker pull aquasec/trivy:latest; then break; fi
-            echo "Retry docker pull trivy ($i/3)..." >&2; sleep 3
+            echo "Retry docker pull trivy ($i/3)"; sleep 3
           done
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 \
@@ -254,7 +256,8 @@ jobs:
           cosign version
       - name: Sign image
         timeout-minutes: 5
-        env: { COSIGN_EXPERIMENTAL: "1" }
+        env:
+          COSIGN_EXPERIMENTAL: "1"
         run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
   dast-zap-baseline:
@@ -268,13 +271,13 @@ jobs:
       - name: Start app container
         timeout-minutes: 2
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
-      - name: ZAP Baseline (no action)
+      - name: ZAP baseline
         timeout-minutes: 35
         run: |
           set -euo pipefail
           for i in 1 2 3; do
             if docker pull owasp/zap2docker-stable:latest; then break; fi
-            echo "Retry docker pull zap ($i/3)..." >&2; sleep 3
+            echo "Retry docker pull zap ($i/3)"; sleep 3
           done
           docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable:latest \
             zap-baseline.py -t http://localhost:8080 -a -r zap-baseline.html
@@ -290,13 +293,13 @@ jobs:
       - name: Start app container
         timeout-minutes: 2
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
-      - name: ZAP Full (no action)
+      - name: ZAP full scan
         timeout-minutes: 55
         run: |
           set -euo pipefail
           for i in 1 2 3; do
             if docker pull owasp/zap2docker-stable:latest; then break; fi
-            echo "Retry docker pull zap ($i/3)..." >&2; sleep 3
+            echo "Retry docker pull zap ($i/3)"; sleep 3
           done
           docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable:latest \
             zap-full-scan.py -t http://localhost:8080 -r zap-full.html || true
@@ -310,7 +313,10 @@ jobs:
     steps:
       - name: Checkout (manual)
         timeout-minutes: 10
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git init .
@@ -324,10 +330,10 @@ jobs:
           set -euo pipefail
           for i in 1 2 3; do
             if docker pull bridgecrew/checkov:latest; then break; fi
-            echo "Retry docker pull checkov ($i/3)..." >&2; sleep 3
+            echo "Retry docker pull checkov ($i/3)"; sleep 3
           done
           docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
-      - name: OPA/Conftest install & run
+      - name: OPA/Conftest install and run
         timeout-minutes: 10
         run: |
           set -euo pipefail
