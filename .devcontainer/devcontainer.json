@@ -1,0 +1,6 @@
+{
+  "name": "secure-api",
+  "image": "mcr.microsoft.com/devcontainers/java:21",
+  "features": {},
+  "postCreateCommand": "./gradlew build"
+}
