@@ -74,7 +74,7 @@ jobs:
                     --metrics=off \
                     --sarif -o reports/semgrep/semgrep.sarif || true
 
-          # Fallback: minimale leere SARIF mit jq erzeugen (kein Here-Doc!)
+          # Fallback: minimale leere SARIF mit jq erzeugen
           if [ ! -s reports/semgrep/semgrep.sarif ]; then
             echo "Semgrep SARIF empty – generating minimal SARIF with jq." >&2
             jq -n '{
@@ -123,7 +123,8 @@ jobs:
             echo "Uploading SARIF (attempt $i/${UPLOAD_MAX_RETRIES})..."
             HTTP=$(curl -sS -o response.json -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/sarif+json" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
               --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
               --max-time "${CURL_MAX_TIME}" \
               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
