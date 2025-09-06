@@ -105,15 +105,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f gradle/wrapper/gradle-wrapper.jar ]; then
-            echo "Wrapper JAR exists; nothing to do."; exit 0; fi
+            echo "Wrapper JAR exists; nothing to do."
+            exit 0
+          fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
-            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+            DIST_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
           else
             DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
             mkdir -p gradle/wrapper
             echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
           fi
+          # Backslashes aus distributionUrl entfernen (https\:// → https://)
+          DIST_URL="$(printf '%s' "$DIST_URL" | sed 's#\\:##g')"
           echo "Using distributionUrl: $DIST_URL"
           VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
           [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
@@ -261,12 +265,13 @@ jobs:
           if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
-            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+            DIST_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
           else
             DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
             mkdir -p gradle/wrapper
             echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
           fi
+          DIST_URL="$(printf '%s' "$DIST_URL" | sed 's#\\:##g')"
           VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
           [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
           TMP=/tmp/gradle; mkdir -p "$TMP"
@@ -338,12 +343,13 @@ jobs:
           if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
-            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+            DIST_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
           else
             DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
             mkdir -p gradle/wrapper
             echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
           fi
+          DIST_URL="$(printf '%s' "$DIST_URL" | sed 's#\\:##g')"
           VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
           [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
           TMP=/tmp/gradle; mkdir -p "$TMP"
@@ -472,7 +478,7 @@ jobs:
             if docker pull bridgecrew/checkov:latest; then break; fi
             echo "Retry docker pull checkov ($i/3)"; sleep 3
           done
-          docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
+          docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo --quiet
       - name: OPA/Conftest install and run
         timeout-minutes: 10
         run: |
