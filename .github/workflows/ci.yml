@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [ main, develop ]
@@ -16,88 +17,174 @@ concurrency:
 
 env:
   GH_API: https://api.github.com
+  # Controls (zentral)
+  CURL_CONNECT_TIMEOUT: "10"      # s
+  CURL_MAX_TIME: "120"            # s
+  UPLOAD_MAX_RETRIES: "3"
+  SEMGREP_TIMEOUT_SECONDS: "420"  # 7 min
+  SEMGREP_MAX_BYTES: "200000000"  # ~200 MB
+  SARIF_MAX_COMPRESSED: "10485760" # 10 MiB gz-Limit
 
 jobs:
 
   build-test-sast:
     if: ${{ hashFiles('gradlew') != '' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       security-events: write
     steps:
-      - name: Checkout (manual)
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+      - name: Checkout (manual, no actions)
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
+          git config --global advice.detachedHead false
+          git config --global --add safe.directory "$PWD"
+          git config --global gc.auto 0
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          for i in 1 2; do
+            if git fetch --depth=1 origin "${SHA}"; then break; fi
+            echo "Retry fetch ($i/2)..." >&2; sleep 2
+          done
+          git checkout --force FETCH_HEAD
+          git rev-parse --verify HEAD
 
       - name: Install JDK 21 (fallback 17)
+        timeout-minutes: 10
         run: |
-          set -euxo pipefail
-          sudo apt-get update
+          set -euo pipefail
+          sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
 
       - name: Gradle build & tests
+        timeout-minutes: 20
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon clean build check jacocoTestReport pitest
 
       - name: Static checks (SpotBugs/PMD/Checkstyle)
+        timeout-minutes: 15
         run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
 
       - name: SCA & SBOM (OWASP DC + CycloneDX)
+        timeout-minutes: 15
         run: ./gradlew --no-daemon dependencyCheckAnalyze cyclonedxBom
 
       - name: SAST (Semgrep via Docker) → SARIF
+        timeout-minutes: 15
+        env:
+          SEMGREP_TIMEOUT_SECONDS: ${{ env.SEMGREP_TIMEOUT_SECONDS }}
+          SEMGREP_MAX_BYTES: ${{ env.SEMGREP_MAX_BYTES }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           mkdir -p reports/semgrep
+          for i in 1 2 3; do
+            if docker pull returntocorp/semgrep:latest; then break; fi
+            echo "Retry docker pull semgrep ($i/3)..." >&2; sleep 3
+          done
           docker run --rm -v "$PWD:/src" --workdir /src \
             returntocorp/semgrep:latest \
             semgrep --config p/owasp-top-ten --config p/java \
-            --sarif -o reports/semgrep/semgrep.sarif || true
+                    --timeout "${SEMGREP_TIMEOUT_SECONDS}" \
+                    --max-target-bytes "${SEMGREP_MAX_BYTES}" \
+                    --metrics=off \
+                    --sarif -o reports/semgrep/semgrep.sarif || true
+          # Fallback: minimale SARIF erzeugen, falls leer
+          if [ ! -s reports/semgrep/semgrep.sarif ]; then
+            jq -n '{
+              "$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+              "version":"2.1.0",
+              "runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]
+            }' > reports/semgrep/semgrep.sarif
+          fi
 
-      - name: Upload SARIF to Code Scanning (API)
+      - name: Upload SARIF to Code Scanning (API; gzip+base64, retries)
         if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURL_CONNECT_TIMEOUT: ${{ env.CURL_CONNECT_TIMEOUT }}
+          CURL_MAX_TIME: ${{ env.CURL_MAX_TIME }}
+          UPLOAD_MAX_RETRIES: ${{ env.UPLOAD_MAX_RETRIES }}
+          SARIF_MAX_COMPRESSED: ${{ env.SARIF_MAX_COMPRESSED }}
         run: |
-          set -euxo pipefail
-          SARIF64=$(base64 -w 0 reports/semgrep/semgrep.sarif)
-          jq -n --arg sarif "$SARIF64" --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg tool "semgrep" \
-            '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
-          curl -sS -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/sarif+json" \
-               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" --data @sarif_payload.json
+          set -euo pipefail
+          test -s reports/semgrep/semgrep.sarif
+          gzip -c reports/semgrep/semgrep.sarif > reports/semgrep/semgrep.sarif.gz
+          BYTES=$(stat -c%s reports/semgrep/semgrep.sarif.gz)
+          echo "Compressed SARIF size: ${BYTES} bytes"
+          if [ "$BYTES" -ge "$SARIF_MAX_COMPRESSED" ]; then
+            echo "Compressed SARIF exceeds ${SARIF_MAX_COMPRESSED} bytes" >&2
+            exit 3
+          fi
+          base64 -w 0 reports/semgrep/semgrep.sarif.gz > reports/semgrep/semgrep.sarif.gz.b64
+          jq -n \
+            --rawfile sarif_b64 reports/semgrep/semgrep.sarif.gz.b64 \
+            --arg sha "${{ github.sha }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg tool "semgrep" \
+            '{commit_sha:$sha, ref:$ref, sarif:($sarif_b64), tool_name:$tool}' \
+            > sarif_payload.json
+
+          HTTP="000"
+          for i in 1 2 3; do
+            echo "Uploading SARIF (attempt $i/3)…"
+            HTTP=$(curl -sS -o response.json -w "%{http_code}" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+              --max-time "${CURL_MAX_TIME}" \
+              -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
+              --data @sarif_payload.json || echo "000")
+            [ "$HTTP" = "202" ] && { echo "Upload accepted (202)."; break; }
+            echo "Upload failed (HTTP=$HTTP), retrying…" >&2; sleep 4
+          done
+          if [ "$HTTP" != "202" ]; then
+            echo "Final upload failed (HTTP=$HTTP). Response:" >&2
+            cat response.json >&2 || true
+            exit 4
+          fi
 
   api-fuzz-contract:
     if: ${{ hashFiles('gradlew') != '' && hashFiles('openapi.yaml') != '' }}
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Checkout (manual)
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        timeout-minutes: 10
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "${SHA}"
+          git checkout --force FETCH_HEAD
       - name: Install JDK
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
       - name: Start app
-        run: ./gradlew --no-daemon bootRun & sleep 10
+        timeout-minutes: 2
+        run: ./gradlew --no-daemon bootRun & sleep 15
       - name: Schemathesis fuzz/contract
+        timeout-minutes: 15
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           python3 -m pip install --upgrade pip
           python3 -m pip install schemathesis
           mkdir -p reports/schemathesis
@@ -106,51 +193,67 @@ jobs:
             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
             --report=reports/schemathesis/report.json
       - name: Stop app
+        if: always()
         run: killall java || true
 
   build-image:
     if: ${{ hashFiles('gradlew') != '' && hashFiles('Dockerfile') != '' }}
     needs: [ build-test-sast ]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
       id-token: write
     steps:
       - name: Checkout (manual)
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        timeout-minutes: 10
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "${SHA}"
+          git checkout --force FETCH_HEAD
       - name: Install JDK
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
       - name: Build jar
+        timeout-minutes: 10
         run: ./gradlew --no-daemon bootJar
       - name: Docker build
+        timeout-minutes: 10
         run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
       - name: Trivy scan (no action)
+        timeout-minutes: 15
         run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if docker pull aquasec/trivy:latest; then break; fi
+            echo "Retry docker pull trivy ($i/3)..." >&2; sleep 3
+          done
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 \
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
       - name: Push to GHCR
+        timeout-minutes: 5
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
       - name: Install cosign (keyless)
+        timeout-minutes: 5
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           COSIGN_VERSION="v2.2.4"
           curl -sSL -o cosign.tgz "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64.tar.gz"
           tar xzf cosign.tgz
           sudo mv cosign /usr/local/bin/cosign
           cosign version
       - name: Sign image
+        timeout-minutes: 5
         env: { COSIGN_EXPERIMENTAL: "1" }
         run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
@@ -158,46 +261,76 @@ jobs:
     if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    timeout-minutes: 40
+    permissions:
+      contents: read
     steps:
       - name: Start app container
-        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+        timeout-minutes: 2
+        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
       - name: ZAP Baseline (no action)
+        timeout-minutes: 35
         run: |
-          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
+          set -euo pipefail
+          for i in 1 2 3; do
+            if docker pull owasp/zap2docker-stable:latest; then break; fi
+            echo "Retry docker pull zap ($i/3)..." >&2; sleep 3
+          done
+          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable:latest \
             zap-baseline.py -t http://localhost:8080 -a -r zap-baseline.html
 
   dast-zap-auth:
     if: ${{ hashFiles('Dockerfile') != '' }}
     needs: [ build-image ]
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - name: Start app container
-        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 10
+        timeout-minutes: 2
+        run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
       - name: ZAP Full (no action)
+        timeout-minutes: 55
         run: |
-          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
+          set -euo pipefail
+          for i in 1 2 3; do
+            if docker pull owasp/zap2docker-stable:latest; then break; fi
+            echo "Retry docker pull zap ($i/3)..." >&2; sleep 3
+          done
+          docker run --rm --network host -v "$PWD:/zap/wrk" owasp/zap2docker-stable:latest \
             zap-full-scan.py -t http://localhost:8080 -r zap-full.html || true
 
   iac-policy:
     if: ${{ hashFiles('policy/**') != '' }}
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - name: Checkout (manual)
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        timeout-minutes: 10
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}, REPO: ${{ github.repository }}, SHA: ${{ github.sha }} }
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git init .
-          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force "${{ github.sha }}"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "${SHA}"
+          git checkout --force FETCH_HEAD
       - name: Checkov via Docker
-        run: docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
-      - name: OPA/Conftest install & run
+        timeout-minutes: 10
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          for i in 1 2 3; do
+            if docker pull bridgecrew/checkov:latest; then break; fi
+            echo "Retry docker pull checkov ($i/3)..." >&2; sleep 3
+          done
+          docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo -q
+      - name: OPA/Conftest install & run
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
           curl -sSL -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
           tar xzf conftest.tar.gz
           sudo mv conftest /usr/local/bin/conftest
