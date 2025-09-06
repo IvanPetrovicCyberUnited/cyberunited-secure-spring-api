@@ -1,0 +1,53 @@
+name: Bootstrap Code Scanning (no actions)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  GH_API: https://api.github.com
+
+jobs:
+  bootstrap-sarif:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (manual, no actions)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          git init .
+          git -c protocol.version=2 remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force "${{ github.sha }}"
+
+      - name: Run Semgrep in Docker and produce SARIF
+        run: |
+          set -euxo pipefail
+          mkdir -p reports/semgrep
+          docker run --rm -v "$PWD:/src" --workdir /src \
+            returntocorp/semgrep:latest \
+            semgrep --config p/owasp-top-ten --config p/java \
+            --sarif -o reports/semgrep/semgrep.sarif || true
+
+      - name: Upload SARIF to GitHub Code Scanning via API
+        if: ${{ hashFiles('reports/semgrep/semgrep.sarif') != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          SARIF64=$(base64 -w 0 reports/semgrep/semgrep.sarif)
+          jq -n --arg sarif "$SARIF64" \
+                --arg sha "${{ github.sha }}" \
+                --arg ref "${{ github.ref }}" \
+                --arg tool "semgrep" \
+                '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
+          curl -sS -H "Authorization: token $GITHUB_TOKEN" \
+               -H "Accept: application/sarif+json" \
+               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
+               --data @sarif_payload.json
