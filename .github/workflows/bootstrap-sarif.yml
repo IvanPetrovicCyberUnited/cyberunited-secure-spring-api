@@ -11,18 +11,18 @@ permissions:
 
 env:
   GH_API: https://api.github.com
-  # Steuerung/Controls
-  SEMGREP_TIMEOUT_SECONDS: "420"         # Max. Laufzeit Semgrep (7 Min)
-  SEMGREP_MAX_BYTES: "200000000"         # Max. Bytes der Zielquellen (~200MB)
-  UPLOAD_MAX_RETRIES: "3"                # Upload-Versuche
-  CURL_CONNECT_TIMEOUT: "10"             # Sek. bis Verbindungsaufbau
-  CURL_MAX_TIME: "120"                   # Max. Gesamtdauer eines Upload-Calls (Sek.)
-  SARIF_MAX_COMPRESSED: "10485760"       # 10 MiB Limit für gzip+base64 (GitHub Anforderung)
+  # Controls
+  SEMGREP_TIMEOUT_SECONDS: "420"         # 7 Min
+  SEMGREP_MAX_BYTES: "200000000"         # ~200 MB
+  UPLOAD_MAX_RETRIES: "3"
+  CURL_CONNECT_TIMEOUT: "10"
+  CURL_MAX_TIME: "120"
+  SARIF_MAX_COMPRESSED: "10485760"       # 10 MiB gz-Limit
 
 jobs:
   bootstrap-sarif:
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # Job-Hardlimit
+    timeout-minutes: 45
     steps:
       - name: Install prerequisites (jq, coreutils)
         timeout-minutes: 10
@@ -47,7 +47,6 @@ jobs:
           git config --global --add safe.directory "$PWD"
           git config --global gc.auto 0
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
-          # 2 Versuche beim Fetch (kurze Flakes abfangen)
           for i in 1 2; do
             if git fetch --depth=1 origin "${SHA}"; then break; fi
             echo "Retry fetch ($i/2)..." >&2; sleep 2
@@ -63,12 +62,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p reports/semgrep
-          # Docker Pull mit 2 Retries
           for i in 1 2 3; do
             if docker pull returntocorp/semgrep:latest; then break; fi
             echo "Retry docker pull semgrep ($i/3)..." >&2; sleep 3
           done
-          # Semgrep: Timeout, Größenlimit, keine Telemetrie, SARIF-Ausgabe
           docker run --rm -v "$PWD:/src" --workdir /src \
             returntocorp/semgrep:latest \
             semgrep --config p/owasp-top-ten --config p/java \
@@ -76,11 +73,9 @@ jobs:
                     --max-target-bytes "${SEMGREP_MAX_BYTES}" \
                     --metrics=off \
                     --sarif -o reports/semgrep/semgrep.sarif || true
-
-          # Prüfen, ob SARIF existiert und nicht leer ist
+          # Fallback: minimale leere SARIF, damit der Upload immer klappt
           if [ ! -s reports/semgrep/semgrep.sarif ]; then
-            echo "Semgrep SARIF empty or missing – nothing to upload (this won't fail the job)." >&2
-            # Trotzdem eine minimale leere SARIF erzeugen, damit ‘Require code scanning results’ erfüllt werden kann
+            echo "Semgrep SARIF empty – generating minimal SARIF." >&2
             cat > reports/semgrep/semgrep.sarif <<'EOF'
             {
               "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
@@ -101,47 +96,48 @@ jobs:
         run: |
           set -euo pipefail
           test -s reports/semgrep/semgrep.sarif
-          # Komprimieren + base64, dann Größencheck (< 10 MiB)
+
+          # gzip → Datei; Größe prüfen (API-Limit 10 MiB gz)
           gzip -c reports/semgrep/semgrep.sarif > reports/semgrep/semgrep.sarif.gz
           BYTES=$(stat -c%s reports/semgrep/semgrep.sarif.gz)
           echo "Compressed SARIF size: ${BYTES} bytes"
           if [ "$BYTES" -ge "$SARIF_MAX_COMPRESSED" ]; then
-            echo "Compressed SARIF exceeds ${SARIF_MAX_COMPRESSED} bytes (10 MiB) – aborting to comply with API limits." >&2
+            echo "Compressed SARIF exceeds ${SARIF_MAX_COMPRESSED} bytes (10 MiB) – aborting." >&2
             exit 3
           fi
-          SARIF_GZ_B64=$(base64 -w 0 reports/semgrep/semgrep.sarif.gz)
 
-          jq -n --arg sarif "$SARIF_GZ_B64" \
-                --arg sha "${{ github.sha }}" \
-                --arg ref "${{ github.ref }}" \
-                --arg tool "semgrep" \
-                '{commit_sha:$sha, ref:$ref, sarif:$sarif, tool_name:$tool}' > sarif_payload.json
+          # base64 → in Datei (kein riesiger Shell-String)
+          timeout 60s base64 -w 0 reports/semgrep/semgrep.sarif.gz > reports/semgrep/semgrep.sarif.gz.b64 || {
+            echo "base64 encoding timed out" >&2; exit 5; }
 
-          # Upload mit Retries und HTTP-Code-Prüfung (erwartet 202)
-          RESP=""
-          CODE=0
+          # JSON-Payload ohne große Shell-Variablen (rawfile einbinden)
+          jq -n \
+            --rawfile sarif_b64 reports/semgrep/semgrep.sarif.gz.b64 \
+            --arg sha "${{ github.sha }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg tool "semgrep" \
+            '{commit_sha:$sha, ref:$ref, sarif:($sarif_b64), tool_name:$tool}' \
+            > sarif_payload.json
+
+          # Upload mit Retries; erwartet HTTP 202
           for i in $(seq 1 "${UPLOAD_MAX_RETRIES}"); do
             echo "Uploading SARIF (attempt $i/${UPLOAD_MAX_RETRIES})..."
-            set +e
-            RESP=$(curl -sS -o response.json -w "%{http_code}" \
+            HTTP=$(curl -sS -o response.json -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/sarif+json" \
               --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
               --max-time "${CURL_MAX_TIME}" \
               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
-              --data @sarif_payload.json)
-            CODE=$?
-            set -e
-            if [ "$CODE" -eq 0 ] && [ "$RESP" = "202" ]; then
-              echo "Upload accepted (HTTP 202)."
-              break
+              --data @sarif_payload.json) || HTTP="000"
+            if [ "$HTTP" = "202" ]; then
+              echo "Upload accepted (HTTP 202)."; break
             fi
-            echo "Upload failed (curl_exit=${CODE}, http=${RESP:-n/a}); retrying in 4s..." >&2
+            echo "Upload failed (HTTP=${HTTP}); retrying in 4s..." >&2
             sleep 4
           done
 
-          if [ "$RESP" != "202" ]; then
-            echo "Final upload failed. Last HTTP code: ${RESP:-n/a}. Response body:" >&2
+          if [ "$HTTP" != "202" ]; then
+            echo "Final upload failed. Last HTTP code: ${HTTP}. Response:" >&2
             cat response.json >&2 || true
             exit 4
           fi
