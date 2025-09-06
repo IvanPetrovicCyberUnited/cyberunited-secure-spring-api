@@ -56,8 +56,7 @@ jobs:
           test -f openapi.yaml      && echo "has_openapi=true"     >> $GITHUB_OUTPUT || echo "has_openapi=false"     >> $GITHUB_OUTPUT
           test -f Dockerfile        && echo "has_dockerfile=true"  >> $GITHUB_OUTPUT || echo "has_dockerfile=false"  >> $GITHUB_OUTPUT
           test -d policy            && echo "has_policy=true"      >> $GITHUB_OUTPUT || echo "has_policy=false"      >> $GITHUB_OUTPUT
-          echo "Detected:"
-          cat $GITHUB_OUTPUT
+          echo "Detected:"; cat $GITHUB_OUTPUT
 
   # --- 1) BUILD/TEST/SAST/SCA ---
   build-test-sast:
@@ -100,6 +99,39 @@ jobs:
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
           jq --version
+
+      - name: Bootstrap Gradle wrapper if JAR is missing
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "Wrapper JAR exists; nothing to do."; exit 0; fi
+          PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROP_FILE" ]; then
+            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+          else
+            DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
+            mkdir -p gradle/wrapper
+            echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
+          fi
+          echo "Using distributionUrl: $DIST_URL"
+          VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
+          [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
+          TMP=/tmp/gradle; mkdir -p "$TMP"
+          curl -fsSL --retry 3 -o "$TMP/gradle-${VER}-bin.zip" "$DIST_URL"
+          SHA256="$(sha256sum "$TMP/gradle-${VER}-bin.zip" | awk '{print $1}')"
+          unzip -q "$TMP/gradle-${VER}-bin.zip" -d "$TMP"
+          export GRADLE_HOME="$TMP/gradle-${VER}"
+          export PATH="$GRADLE_HOME/bin:$PATH"
+          gradle --version
+          gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "Wrapper jar not created"; exit 1; }
+          if ! grep -q '^distributionUrl=' "$PROP_FILE"; then echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"; fi
+          if grep -q '^distributionSha256Sum=' "$PROP_FILE"; then
+            sed -i "s#^distributionSha256Sum=.*#distributionSha256Sum=${SHA256}#g" "$PROP_FILE"
+          else
+            echo "distributionSha256Sum=${SHA256}" >> "$PROP_FILE"
+          fi
 
       - name: Gradle build and tests
         timeout-minutes: 20
@@ -213,14 +245,43 @@ jobs:
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
           git fetch --depth=1 origin "${SHA}"
           git checkout --force FETCH_HEAD
+
       - name: Install JDK
         timeout-minutes: 10
         run: |
           sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Bootstrap Gradle wrapper if JAR is missing
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
+          PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROP_FILE" ]; then
+            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+          else
+            DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
+            mkdir -p gradle/wrapper
+            echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
+          fi
+          VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
+          [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
+          TMP=/tmp/gradle; mkdir -p "$TMP"
+          curl -fsSL --retry 3 -o "$TMP/gradle-${VER}-bin.zip" "$DIST_URL"
+          SHA256="$(sha256sum "$TMP/gradle-${VER}-bin.zip" | awk '{print $1}')"
+          unzip -q "$TMP/gradle-${VER}-bin.zip" -d "$TMP"
+          export GRADLE_HOME="$TMP/gradle-${VER}"
+          export PATH="$GRADLE_HOME/bin:$PATH"
+          gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
+          test -f gradle/wrapper/gradle-wrapper.jar
+
       - name: Start app
         timeout-minutes: 2
         run: ./gradlew --no-daemon bootRun & sleep 15
+
       - name: Schemathesis fuzz and contract
         timeout-minutes: 15
         run: |
@@ -232,6 +293,7 @@ jobs:
             --base-url http://localhost:8080 \
             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
             --report=reports/schemathesis/report.json
+
       - name: Stop app
         if: always()
         run: killall java || true
@@ -260,17 +322,47 @@ jobs:
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
           git fetch --depth=1 origin "${SHA}"
           git checkout --force FETCH_HEAD
+
       - name: Install JDK
         timeout-minutes: 10
         run: |
           sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Bootstrap Gradle wrapper if JAR is missing
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
+          PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROP_FILE" ]; then
+            DIST_URL="$(grep '^distributionUrl=' "$PROP_FILE" | sed 's#distributionUrl=##')"
+          else
+            DIST_URL="https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
+            mkdir -p gradle/wrapper
+            echo "distributionUrl=${DIST_URL}" >> "$PROP_FILE"
+          fi
+          VER="$(echo "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
+          [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
+          TMP=/tmp/gradle; mkdir -p "$TMP"
+          curl -fsSL --retry 3 -o "$TMP/gradle-${VER}-bin.zip" "$DIST_URL"
+          SHA256="$(sha256sum "$TMP/gradle-${VER}-bin.zip" | awk '{print $1}')"
+          unzip -q "$TMP/gradle-${VER}-bin.zip" -d "$TMP"
+          export GRADLE_HOME="$TMP/gradle-${VER}"
+          export PATH="$GRADLE_HOME/bin:$PATH"
+          gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
+          test -f gradle/wrapper/gradle-wrapper.jar
+
       - name: Build jar
         timeout-minutes: 10
         run: ./gradlew --no-daemon bootJar
+
       - name: Docker build
         timeout-minutes: 10
         run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
+
       - name: Trivy scan (no action)
         timeout-minutes: 15
         run: |
@@ -282,11 +374,13 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 1 \
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
       - name: Push to GHCR
         timeout-minutes: 5
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
       - name: Install cosign (keyless)
         timeout-minutes: 5
         run: |
@@ -296,6 +390,7 @@ jobs:
           tar xzf cosign.tgz
           sudo mv cosign /usr/local/bin/cosign
           cosign version
+
       - name: Sign image
         timeout-minutes: 5
         env:
