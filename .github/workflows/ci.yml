@@ -11,7 +11,7 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch: {}
 
-# Fix B: Least-privilege auf Workflow-Ebene (Checkov CKV2_GHA_1)
+# Least privilege (fix für CKV2_GHA_1)
 permissions:
   contents: read
 
@@ -30,7 +30,7 @@ env:
 
 jobs:
 
-  # --- 0) DETECT ---
+  # --- 0) DETECT: erkennt Projekt-Layout & setzt Flags ---
   detect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -39,6 +39,7 @@ jobs:
       has_openapi:    ${{ steps.out.outputs.has_openapi }}
       has_dockerfile: ${{ steps.out.outputs.has_dockerfile }}
       has_policy:     ${{ steps.out.outputs.has_policy }}
+      openapi_file:   ${{ steps.out.outputs.openapi_file }}
     steps:
       - name: Checkout (manual)
         env:
@@ -52,15 +53,49 @@ jobs:
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
           git fetch --depth=1 origin "${SHA}"
           git checkout --force FETCH_HEAD
-      - name: Detect files and set outputs
+
+      - name: Detect files and set outputs (debug)
         id: out
         run: |
           set -euo pipefail
-          test -f gradlew           && echo "has_gradle=true"      >> $GITHUB_OUTPUT || echo "has_gradle=false"      >> $GITHUB_OUTPUT
-          test -f openapi.yaml      && echo "has_openapi=true"     >> $GITHUB_OUTPUT || echo "has_openapi=false"     >> $GITHUB_OUTPUT
-          test -f Dockerfile        && echo "has_dockerfile=true"  >> $GITHUB_OUTPUT || echo "has_dockerfile=false"  >> $GITHUB_OUTPUT
-          test -d policy            && echo "has_policy=true"      >> $GITHUB_OUTPUT || echo "has_policy=false"      >> $GITHUB_OUTPUT
-          echo "Detected:"; cat $GITHUB_OUTPUT
+          echo "== ls -la =="
+          ls -la
+          echo "== find (maxdepth 3) =="
+          (set -x; find . -maxdepth 3 -type f \( -name 'gradlew' -o -name 'build.gradle*' -o -name 'settings.gradle*' -o -name 'openapi.y*ml' -o -name 'Dockerfile' \) || true)
+          (set -x; find . -maxdepth 3 -type d -name 'policy' || true)
+
+          # Gradle
+          if [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "has_gradle=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_gradle=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # OpenAPI (yaml/yml)
+          if [ -f openapi.yaml ] || [ -f openapi.yml ]; then
+            OAS=$( [ -f openapi.yaml ] && echo openapi.yaml || echo openapi.yml )
+            echo "has_openapi=true"   >> "$GITHUB_OUTPUT"
+            echo "openapi_file=$OAS"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_openapi=false"  >> "$GITHUB_OUTPUT"
+            echo "openapi_file="      >> "$GITHUB_OUTPUT"
+          fi
+
+          # Dockerfile
+          if [ -f Dockerfile ]; then
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # policy/
+          if [ -d policy ]; then
+            echo "has_policy=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_policy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "== Outputs =="; cat "$GITHUB_OUTPUT"
 
   # --- 1) BUILD/TEST/SAST/SCA ---
   build-test-sast:
@@ -73,7 +108,6 @@ jobs:
       security-events: write
     steps:
       - name: Checkout (manual, no actions)
-        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -92,8 +126,7 @@ jobs:
           git checkout --force FETCH_HEAD
           git rev-parse --verify HEAD
 
-      - name: Install tools (jq, coreutils) and JDK 21 (fallback 17)
-        timeout-minutes: 10
+      - name: Install tools (jq, coreutils) + JDK 21 (fallback 17)
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -102,16 +135,10 @@ jobs:
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
-          jq --version
 
-      - name: Bootstrap Gradle wrapper if JAR is missing
-        timeout-minutes: 5
+      - name: Bootstrap Gradle wrapper (create JAR if missing)
         run: |
           set -euo pipefail
-          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then
-            echo "Wrapper JAR exists; nothing to do."
-            exit 0
-          fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
             RAW_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
@@ -120,9 +147,8 @@ jobs:
             mkdir -p gradle/wrapper
             printf 'distributionUrl=%s\n' "$RAW_URL" >> "$PROP_FILE"
           fi
-          # Properties-Escapes entfernen: "https\://..." -> "https://..."
+          # "https\://..." -> "https://..."
           DIST_URL="$(printf '%s' "$RAW_URL" | sed 's#\\:##g')"
-          echo "Using distributionUrl: $DIST_URL"
           VER="$(printf '%s' "$DIST_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-bin\.zip#\1#p')"
           [ -z "$VER" ] && VER="8.10.2" && DIST_URL="https://services.gradle.org/distributions/gradle-${VER}-bin.zip"
           TMP=/tmp/gradle; mkdir -p "$TMP"
@@ -133,28 +159,19 @@ jobs:
           export PATH="$GRADLE_HOME/bin:$PATH"
           gradle --version
           gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
-          test -f gradle/wrapper/gradle-wrapper.jar || { echo "Wrapper jar not created"; exit 1; }
-          if ! grep -q '^distributionUrl=' "$PROP_FILE"; then printf 'distributionUrl=%s\n' "$RAW_URL" >> "$PROP_FILE"; fi
-          if grep -q '^distributionSha256Sum=' "$PROP_FILE"; then
-            sed -i "s#^distributionSha256Sum=.*#distributionSha256Sum=${SHA256}#g" "$PROP_FILE"
-          else
-            printf 'distributionSha256Sum=%s\n' "$SHA256" >> "$PROP_FILE"
-          fi
+          # Harter Check: JAR MUSS da sein
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "gradle-wrapper.jar fehlt!"; exit 1; }
 
-      - name: Gradle build and tests
-        timeout-minutes: 20
+      - name: Gradle build & tests
         run: |
           set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon clean build check jacocoTestReport pitest
 
       - name: Static checks (SpotBugs/PMD/Checkstyle)
-        timeout-minutes: 15
         run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
 
-      # Fix A: NVD Key + Config-Cache hier deaktivieren
-      - name: SCA and SBOM (OWASP DC + CycloneDX)
-        timeout-minutes: 15
+      - name: SCA & SBOM (OWASP DC + CycloneDX)
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
@@ -163,13 +180,12 @@ jobs:
           if [ -n "${NVD_API_KEY:-}" ]; then
             EXTRA_OPTS="-PdependencyCheck.nvd.apiKey=${NVD_API_KEY}"
           else
-            echo "WARNING: NVD_API_KEY not set – you may hit rate limits."
+            echo "WARNING: NVD_API_KEY not set – NVD kann langsam / ratelimited sein."
           fi
           ./gradlew --no-daemon -Dorg.gradle.unsafe.configuration-cache=false \
             ${EXTRA_OPTS} dependencyCheckAnalyze cyclonedxBom
 
-      - name: SAST Semgrep to SARIF
-        timeout-minutes: 15
+      - name: SAST Semgrep → SARIF
         env:
           SEMGREP_TIMEOUT_SECONDS: ${{ env.SEMGREP_TIMEOUT_SECONDS }}
           SEMGREP_MAX_BYTES: ${{ env.SEMGREP_MAX_BYTES }}
@@ -187,17 +203,14 @@ jobs:
                     --max-target-bytes "${SEMGREP_MAX_BYTES}" \
                     --metrics=off \
                     --sarif -o reports/semgrep/semgrep.sarif || true
-          if [ ! -s reports/semgrep/semgrep.sarif ]; then
-            jq -n '{
-              "$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
-              "version":"2.1.0",
-              "runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]
-            }' > reports/semgrep/semgrep.sarif
-          fi
+          [ -s reports/semgrep/semgrep.sarif ] || jq -n '{
+            "$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+            "version":"2.1.0",
+            "runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]
+          }' > reports/semgrep/semgrep.sarif
 
-      - name: Upload SARIF to Code Scanning (API; gzip+base64, retries)
+      - name: Upload SARIF (API; gzip+base64; retries)
         if: ${{ always() }}
-        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURL_CONNECT_TIMEOUT: ${{ env.CURL_CONNECT_TIMEOUT }}
@@ -206,27 +219,22 @@ jobs:
           SARIF_MAX_COMPRESSED: ${{ env.SARIF_MAX_COMPRESSED }}
         run: |
           set -euo pipefail
-          if [ ! -s reports/semgrep/semgrep.sarif ]; then
-            echo "Missing SARIF, skipping upload"; exit 0
-          fi
+          [ -s reports/semgrep/semgrep.sarif ] || { echo "No SARIF, skip"; exit 0; }
           gzip -c reports/semgrep/semgrep.sarif > reports/semgrep/semgrep.sarif.gz
           BYTES=$(stat -c%s reports/semgrep/semgrep.sarif.gz)
-          echo "Compressed SARIF size: ${BYTES} bytes"
-          if [ "$BYTES" -ge "$SARIF_MAX_COMPRESSED" ]; then
-            echo "Compressed SARIF exceeds limit"; exit 3
-          fi
+          echo "Compressed size: ${BYTES} bytes"
+          [ "$BYTES" -lt "$SARIF_MAX_COMPRESSED" ] || { echo "SARIF gz too large"; exit 3; }
           base64 -w 0 reports/semgrep/semgrep.sarif.gz > reports/semgrep/semgrep.sarif.gz.b64
           jq -n \
             --rawfile sarif_b64 reports/semgrep/semgrep.sarif.gz.b64 \
             --arg sha "${{ github.sha }}" \
             --arg ref "${{ github.ref }}" \
             --arg tool "semgrep" \
-            '{commit_sha:$sha, ref:$ref, sarif:($sarif_b64), tool_name:$tool}' \
-            > sarif_payload.json
+            '{commit_sha:$sha, ref:$ref, sarif:($sarif_b64), tool_name:$tool}' > sarif_payload.json
 
           HTTP="000"
           for i in 1 2 3; do
-            echo "Uploading SARIF (attempt $i/3)"
+            echo "Upload attempt $i/3"
             HTTP=$(curl -sS -o response.json -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/json" \
@@ -236,12 +244,9 @@ jobs:
               -X POST "$GH_API/repos/${{ github.repository }}/code-scanning/sarifs" \
               --data @sarif_payload.json || echo "000")
             [ "$HTTP" = "202" ] && { echo "Upload accepted (202)"; break; }
-            echo "Upload failed (HTTP=$HTTP). Retrying..."; sleep 4
+            echo "Upload failed (HTTP=$HTTP). Retry in 4s"; sleep 4
           done
-          if [ "$HTTP" != "202" ]; then
-            echo "Final upload failed (HTTP=$HTTP). Response:"; cat response.json || true
-            exit 4
-          fi
+          [ "$HTTP" = "202" ] || { echo "Final upload failed"; cat response.json || true; exit 4; }
 
   # --- 2) API fuzz/contract ---
   api-fuzz-contract:
@@ -253,7 +258,6 @@ jobs:
       contents: read
     steps:
       - name: Checkout (manual)
-        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -267,18 +271,15 @@ jobs:
           git checkout --force FETCH_HEAD
 
       - name: Install JDK
-        timeout-minutes: 10
         run: |
           sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Bootstrap Gradle wrapper if JAR is missing
-        timeout-minutes: 5
+      - name: Bootstrap Gradle wrapper (create JAR if missing)
         run: |
           set -euo pipefail
-          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
             RAW_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
@@ -297,20 +298,17 @@ jobs:
           export GRADLE_HOME="$TMP/gradle-${VER}"
           export PATH="$GRADLE_HOME/bin:$PATH"
           gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
-          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "gradle-wrapper.jar fehlt!"; exit 1; }
 
       - name: Start app
-        timeout-minutes: 2
         run: ./gradlew --no-daemon bootRun & sleep 15
 
-      # Fix C: Schemathesis korrekt starten
       - name: Schemathesis fuzz and contract
-        timeout-minutes: 15
         run: |
           set -euo pipefail
           python3 -m pip install --user --upgrade pip schemathesis
           mkdir -p reports/schemathesis
-          python3 -m schemathesis.cli run openapi.yaml --checks all \
+          python3 -m schemathesis.cli run "${{ needs.detect.outputs.openapi_file }}" --checks all \
             --base-url http://localhost:8080 \
             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
             --report=reports/schemathesis/report.json
@@ -331,7 +329,6 @@ jobs:
       id-token: write
     steps:
       - name: Checkout (manual)
-        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -345,18 +342,15 @@ jobs:
           git checkout --force FETCH_HEAD
 
       - name: Install JDK
-        timeout-minutes: 10
         run: |
           sudo apt-get update -y
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Bootstrap Gradle wrapper if JAR is missing
-        timeout-minutes: 5
+      - name: Bootstrap Gradle wrapper (create JAR if missing)
         run: |
           set -euo pipefail
-          if [ -f gradle/wrapper/gradle-wrapper.jar ]; then exit 0; fi
           PROP_FILE="gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$PROP_FILE" ]; then
             RAW_URL="$(sed -n 's/^distributionUrl=//p' "$PROP_FILE")"
@@ -375,18 +369,15 @@ jobs:
           export GRADLE_HOME="$TMP/gradle-${VER}"
           export PATH="$GRADLE_HOME/bin:$PATH"
           gradle wrapper --gradle-version "$VER" --gradle-distribution-sha256-sum "$SHA256"
-          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "gradle-wrapper.jar fehlt!"; exit 1; }
 
       - name: Build jar
-        timeout-minutes: 10
         run: ./gradlew --no-daemon bootJar
 
       - name: Docker build
-        timeout-minutes: 10
         run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
 
       - name: Trivy scan (no action)
-        timeout-minutes: 15
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -398,13 +389,11 @@ jobs:
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
       - name: Push to GHCR
-        timeout-minutes: 5
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
 
       - name: Install cosign (keyless)
-        timeout-minutes: 5
         run: |
           set -euo pipefail
           COSIGN_VERSION="v2.2.4"
@@ -414,7 +403,6 @@ jobs:
           cosign version
 
       - name: Sign image
-        timeout-minutes: 5
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: cosign sign ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
@@ -429,10 +417,8 @@ jobs:
       contents: read
     steps:
       - name: Start app container
-        timeout-minutes: 2
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
       - name: ZAP baseline
-        timeout-minutes: 35
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -451,10 +437,8 @@ jobs:
       contents: read
     steps:
       - name: Start app container
-        timeout-minutes: 2
         run: docker run -d -p 8080:8080 ghcr.io/${{ github.repository }}:sha-${{ github.sha }} && sleep 15
       - name: ZAP full scan
-        timeout-minutes: 55
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -474,7 +458,6 @@ jobs:
       contents: read
     steps:
       - name: Checkout (manual)
-        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -486,8 +469,8 @@ jobs:
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
           git fetch --depth=1 origin "${SHA}"
           git checkout --force FETCH_HEAD
+
       - name: Checkov via Docker
-        timeout-minutes: 10
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -495,8 +478,8 @@ jobs:
             echo "Retry docker pull checkov ($i/3)"; sleep 3
           done
           docker run --rm -v "$PWD:/repo" bridgecrew/checkov:latest -d /repo --quiet
+
       - name: OPA/Conftest install and run
-        timeout-minutes: 10
         run: |
           set -euo pipefail
           curl -sSL -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
