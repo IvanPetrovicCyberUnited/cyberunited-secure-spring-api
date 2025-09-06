@@ -2,12 +2,36 @@ openapi: 3.0.1
 info:
   title: CyberUnited Secure API
   version: 1.0.0
+  description: >
+    Kleine Demo-API für Security-Tests. Einheitliches Fehlerformat, JWT (Bearer),
+    restriktive Defaults. Öffentliche Endpunkte sind ausdrücklich pro Operation freigegeben.
+
 servers:
   - url: http://localhost:8080
+
+tags:
+  - name: Health
+    description: Liveness & Readiness
+  - name: Auth
+    description: Anmeldung & Token
+  - name: Echo
+    description: Validiertes Echo
+  - name: Users
+    description: Benutzer-Ressourcen
+  - name: Admin
+    description: Administrative Funktionen
+
+# Global: Auth erforderlich (Bearer); öffentliche Endpunkte überschreiben mit `security: []`
+security:
+  - bearerAuth: []
+
 paths:
   /api/health:
     get:
+      tags: [Health]
       summary: Health check
+      description: Öffentlicher Liveness-Check.
+      security: []     # öffentlich
       responses:
         '200':
           description: OK
@@ -16,80 +40,313 @@ paths:
               schema:
                 type: string
                 example: OK
+
   /api/auth/login:
     post:
+      tags: [Auth]
       summary: Login
+      description: Öffentlicher Login; gibt ein kurzlebiges JWT zurück.
+      security: []     # öffentlich
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-              required: [username, password]
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              default:
+                value: { username: "user", password: "password" }
       responses:
         '200':
           description: JWT token
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  token:
-                    type: string
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
   /api/echo:
     get:
+      tags: [Echo]
       summary: Echo sanitized input
+      description: Öffentlicher Endpunkt. Gibt die bereinigte Eingabe zurück.
+      security: []     # öffentlich
       parameters:
         - in: query
           name: q
           required: true
+          description: Zu echoender Text (wird serverseitig bereinigt)
           schema:
             type: string
+            maxLength: 200
       responses:
         '200':
           description: Echo response
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  q:
-                    type: string
+                $ref: '#/components/schemas/EchoResponse'
+              examples:
+                default:
+                  value: { q: "hello" }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
   /api/users/me:
     get:
-      security:
-        - bearerAuth: []
+      tags: [Users]
+      summary: Aktueller Benutzer
+      description: Gibt das eigene Benutzerprofil zurück (JWT erforderlich).
       responses:
         '200':
           description: Current user
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
   /api/users/{id}:
     get:
-      security:
-        - bearerAuth: []
+      tags: [Users]
+      summary: Benutzer nach ID (nur eigene ID erlaubt)
+      description: >
+        Gibt Benutzerdaten zur angegebenen ID zurück, **nur wenn es die eigene ID** ist.
+        Andernfalls 403 (IDOR-Schutz).
       parameters:
         - in: path
           name: id
           required: true
           schema:
             type: integer
+            format: int64
       responses:
         '200':
           description: User
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
   /api/admin/stats:
     post:
-      security:
-        - bearerAuth: []
+      tags: [Admin]
+      summary: Admin-Statistiken
+      description: Nur für ROLE_ADMIN erlaubt.
       responses:
         '200':
           description: Stats
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+
+  headers:
+    CorrelationId:
+      description: Korrelation-ID für Logging/Tracing.
+      schema:
+        type: string
+      example: "b6e5c7b4-9d9c-4c2d-8a86-2b0e5a1f6a0d"
+    RetryAfter:
+      description: Sekunden bis zum nächsten zulässigen Request (Rate-Limit).
+      schema:
+        type: integer
+        format: int32
+      example: 60
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          maxLength: 100
+        password:
+          type: string
+          format: password
+          maxLength: 100
+
+    LoginResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: JWT Bearer Token
+
+    EchoResponse:
+      type: object
+      required: [q]
+      properties:
+        q:
+          type: string
+
+    User:
+      type: object
+      required: [id, username, roles]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        username:
+          type: string
+          example: user
+        roles:
+          type: array
+          items:
+            type: string
+          example: [ "ROLE_USER" ]
+
+    StatsResponse:
+      type: object
+      properties:
+        usersTotal:
+          type: integer
+          format: int32
+          example: 2
+        timestamp:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      required: [timestamp, path, code, message, correlationId]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        path:
+          type: string
+          example: /api/echo
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: Query parameter 'q' must not be blank
+        correlationId:
+          type: string
+          example: b6e5c7b4-9d9c-4c2d-8a86-2b0e5a1f6a0d
+
+  responses:
+    Unauthorized:
+      description: Nicht authentifiziert
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            default:
+              value:
+                timestamp: "2025-01-01T12:00:00Z"
+                path: "/api/users/me"
+                code: "UNAUTHORIZED"
+                message: "Missing or invalid bearer token"
+                correlationId: "b6e5c7b4-9d9c-4c2d-8a86-2b0e5a1f6a0d"
+
+    Forbidden:
+      description: Keine Berechtigung
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            default:
+              value:
+                timestamp: "2025-01-01T12:00:00Z"
+                path: "/api/admin/stats"
+                code: "FORBIDDEN"
+                message: "Not allowed for your role"
+                correlationId: "b6e5c7b4-9d9c-4c2d-8a86-2b0e5a1f6a0d"
+
+    ValidationError:
+      description: Validierung fehlgeschlagen
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    TooManyRequests:
+      description: Rate-Limit überschritten
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ServerError:
+      description: Unerwarteter Serverfehler
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
