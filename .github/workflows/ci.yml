@@ -87,7 +87,7 @@ jobs:
           cache: gradle
       - run: ./gradlew bootJar --no-daemon
       - run: docker build -t ghcr.io/${{ github.repository }}:sha-${{ github.sha }} .
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: hadolint/hadolint-action@v3.2.0
         with:
           dockerfile: Dockerfile
       - uses: aquasecurity/trivy-action@v0.24.0
