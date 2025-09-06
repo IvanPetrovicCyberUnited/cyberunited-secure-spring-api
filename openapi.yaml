@@ -1,0 +1,100 @@
+openapi: 3.0.1
+info:
+  title: CyberUnited Secure API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /api/health:
+    get:
+      security: []
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: OK
+  /api/auth/login:
+    post:
+      security: []
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+              required: [username, password]
+      responses:
+        '200':
+          description: JWT token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+  /api/echo:
+    get:
+      security: []
+      summary: Echo sanitized input
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Echo response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  q:
+                    type: string
+  /api/users/me:
+    get:
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user
+  /api/users/{id}:
+    get:
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: User
+  /api/admin/stats:
+    post:
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Stats
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
