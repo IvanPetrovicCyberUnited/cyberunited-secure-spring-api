@@ -71,6 +71,8 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    env:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
     steps:
       - name: Checkout (manual, no actions)
         timeout-minutes: 10
@@ -103,6 +105,23 @@ jobs:
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
           java -version
           jq --version
+
+      - name: Write NVD API key to ~/.gradle/gradle.properties
+        run: |
+          mkdir -p ~/.gradle
+          if [ -z "${NVD_API_KEY}" ]; then
+            echo "NVD_API_KEY is not set" >&2
+            exit 1
+          fi
+          ( [ -f ~/.gradle/gradle.properties ] && grep -v '^nvd\.apiKey=' ~/.gradle/gradle.properties || true ) > /tmp/gp || true
+          echo "nvd.apiKey=${NVD_API_KEY}" >> /tmp/gp
+          mv /tmp/gp ~/.gradle/gradle.properties
+
+      - name: Debug NVD API key
+        run: |
+          set -euo pipefail
+          echo "Env NVD_API_KEY length: ${#NVD_API_KEY}"
+          grep -n 'apiKey' ~/.gradle/gradle.properties | sed 's/apiKey=.*/apiKey=***REDACTED***/'
 
       - name: Bootstrap Gradle wrapper if JAR is missing
         timeout-minutes: 5
@@ -152,21 +171,15 @@ jobs:
         timeout-minutes: 15
         run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
 
-      # Fix A: NVD Key + Config-Cache hier deaktivieren
-      - name: SCA and SBOM (OWASP DC + CycloneDX)
+      - name: Dependency-Check (with NVD key, config cache disabled)
         timeout-minutes: 15
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
-          set -euo pipefail
-          EXTRA_OPTS=""
-          if [ -n "${NVD_API_KEY:-}" ]; then
-            EXTRA_OPTS="-PdependencyCheck.nvd.apiKey=${NVD_API_KEY}"
-          else
-            echo "WARNING: NVD_API_KEY not set – you may hit rate limits."
-          fi
-          ./gradlew --no-daemon -Dorg.gradle.unsafe.configuration-cache=false \
-            ${EXTRA_OPTS} dependencyCheckAnalyze cyclonedxBom
+          ./gradlew \
+            --no-daemon \
+            --no-configuration-cache \
+            -Dorg.gradle.configuration-cache=false \
+            -Dnvd.apiKey="${NVD_API_KEY}" \
+            dependencyCheckAnalyze cyclonedxBom
 
       - name: SAST Semgrep to SARIF
         timeout-minutes: 15
@@ -311,7 +324,7 @@ jobs:
           python3 -m pip install --user --upgrade pip schemathesis
           mkdir -p reports/schemathesis
           python3 -m schemathesis.cli run openapi.yaml --checks all \
-            --base-url http://localhost:8080 \
+            --url http://localhost:8080 \
             --hypothesis-deadline=200 --hypothesis-max-examples=200 \
             --report=reports/schemathesis/report.json
 
