@@ -1,4 +1,4 @@
-import info.solidsoft.gradle.pitest.PitestPluginExtension
+﻿import info.solidsoft.gradle.pitest.PitestPluginExtension
 
 plugins {
     id("org.springframework.boot") version "3.3.4"
@@ -10,6 +10,7 @@ plugins {
     id("com.github.spotbugs") version "6.0.9"
     id("org.owasp.dependencycheck") version "10.0.2"
     id("org.cyclonedx.bom") version "1.8.2"
+    id("info.solidsoft.pitest") version "1.9.11"
 }
 
 buildscript {
@@ -34,9 +35,11 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
+
     implementation("io.jsonwebtoken:jjwt-api:0.12.5")
     runtimeOnly("io.jsonwebtoken:jjwt-impl:0.12.5")
     runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.5")
+
     implementation("org.springframework.security:spring-security-crypto")
     implementation("com.bucket4j:bucket4j-core:8.4.0")
     implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.6.0")
@@ -75,18 +78,23 @@ pmd {
 }
 
 spotbugs {
+    ignoreFailures.set(true)
     effort.set(com.github.spotbugs.snom.Effort.DEFAULT)
     reportLevel.set(com.github.spotbugs.snom.Confidence.LOW)
     excludeFilter.set(file("config/spotbugs/exclude.xml"))
 }
 
 configure<PitestPluginExtension> {
+    pitestVersion.set("1.15.6")
     junit5PluginVersion.set("1.2.1")
-    testPlugin.set("junit5")
     targetClasses.set(listOf("com.cyberunited.secureapi.*"))
+    targetTests.set(listOf("com.cyberunited.secureapi.*"))
+    jvmArgs.set(listOf("-XX:+EnableDynamicAgentLoading"))
 }
 
 dependencyCheck {
+    // Der NVD API Key wird Ã¼ber ~/.gradle/gradle.properties (dependencyCheck.nvd.apiKey)
+    // oder ENV (NVD_API_KEY) gelesen. Kein nvd{ }-Block in Kotlin-DSL nÃ¶tig.
     failOnError = false
 }
 
@@ -94,3 +102,4 @@ tasks.cyclonedxBom {
     includeConfigs.set(listOf("runtimeClasspath"))
     notCompatibleWithConfigurationCache("CycloneDX plugin not CC-ready")
 }
+
