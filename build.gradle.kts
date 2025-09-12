@@ -7,7 +7,7 @@ plugins {
     id("jacoco")
     id("pmd")
     id("checkstyle")
-    id("com.github.spotbugs") version "6.0.9"
+    id("com.github.spotbugs") version "6.3.0"
     id("org.owasp.dependencycheck") version "10.0.2"
     id("org.cyclonedx.bom") version "1.8.2"
     id("info.solidsoft.pitest") version "1.9.11"
