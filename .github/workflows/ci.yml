@@ -71,9 +71,6 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    # ⭐ NVD Key auf Job-Ebene verfügbar machen
-    env:
-      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
     steps:
       - name: Checkout (manual, no actions)
         timeout-minutes: 10
@@ -95,12 +92,12 @@ jobs:
           git checkout --force FETCH_HEAD
           git rev-parse --verify HEAD
 
-      - name: Install tools (jq, coreutils, unzip) and JDK 21 (fallback 17)
+      - name: Install tools (jq, coreutils) and JDK 21 (fallback 17)
         timeout-minutes: 10
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq coreutils unzip
+          sudo apt-get install -y jq coreutils
           sudo apt-get install -y openjdk-21-jdk || sudo apt-get install -y openjdk-17-jdk
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
           echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
@@ -155,26 +152,16 @@ jobs:
         timeout-minutes: 15
         run: ./gradlew --no-daemon spotbugsMain spotbugsTest pmdMain pmdTest checkstyleMain checkstyleTest
 
-      # ⭐ DC-DB cachen – beschleunigt NVD-Updates enorm
-      - name: Cache dependency-check DB
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository/org/owasp/dependency-check-data
-          key: ${{ runner.os }}-dcdb-${{ hashFiles('**/gradle.lockfile') }}
-          restore-keys: |
-            ${{ runner.os }}-dcdb-
-
-      # Fix A: NVD Key + Config-Cache aus + robuste Properties
+      # Fix A: NVD Key + Config-Cache hier deaktivieren
       - name: SCA and SBOM (OWASP DC + CycloneDX)
-        timeout-minutes: 20
+        timeout-minutes: 15
         env:
-          NVD_API_KEY: ${{ env.NVD_API_KEY }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           set -euo pipefail
           EXTRA_OPTS=""
           if [ -n "${NVD_API_KEY:-}" ]; then
-            # Sowohl Gradle-Property als auch System-Property setzen
-            EXTRA_OPTS="-PdependencyCheck.nvd.apiKey=${NVD_API_KEY} -Dnvd.api.key=${NVD_API_KEY}"
+            EXTRA_OPTS="-PdependencyCheck.nvd.apiKey=${NVD_API_KEY}"
           else
             echo "WARNING: NVD_API_KEY not set – you may hit rate limits."
           fi
