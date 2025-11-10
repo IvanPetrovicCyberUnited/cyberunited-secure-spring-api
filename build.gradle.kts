@@ -15,7 +15,7 @@ plugins {
 
 buildscript {
     repositories { mavenCentral() }
-    dependencies { classpath("info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.9.11") }
+    dependencies { classpath("info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.15.0") }
 }
 
 apply(plugin = "info.solidsoft.pitest")
