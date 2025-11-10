@@ -47,7 +47,7 @@ dependencies {
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("io.rest-assured:rest-assured:5.4.0")
     testImplementation("com.code-intelligence:jazzer-junit:0.25.0")
-    testImplementation("net.jqwik:jqwik:1.9.1")
+    testImplementation("net.jqwik:jqwik:1.9.3")
 }
 
 tasks.withType<Test> {
